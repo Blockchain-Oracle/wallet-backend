@@ -131,6 +131,52 @@ func TestAddrString(t *testing.T) {
 		_, ok := addrString(u32ScVal(1))
 		assert.False(t, ok)
 	})
+
+	// The other address kinds an ScAddress can hold go through types.StorableAddressString,
+	// as in the SEP-41 processor (#756): a muxed form reduces to its base account or contract,
+	// and a claimable-balance or liquidity-pool address, which no account or contract key can
+	// hold, is refused.
+	accountScAddr := accountAddrScVal(t, accountAddr).MustAddress()
+	contractScAddr := contractAddrScVal(t, contractAddr).MustAddress()
+	scAddrVal := func(a xdr.ScAddress) xdr.ScVal {
+		return xdr.ScVal{Type: xdr.ScValTypeScvAddress, Address: &a}
+	}
+
+	t.Run("reduces a muxed account to its base account", func(t *testing.T) {
+		s, ok := addrString(scAddrVal(xdr.ScAddress{
+			Type:         xdr.ScAddressTypeScAddressTypeMuxedAccount,
+			MuxedAccount: &xdr.MuxedEd25519Account{Id: 42, Ed25519: *accountScAddr.AccountId.Ed25519},
+		}))
+		require.True(t, ok)
+		assert.Equal(t, accountAddr, s)
+	})
+
+	t.Run("reduces a muxed contract to its base contract", func(t *testing.T) {
+		s, ok := addrString(scAddrVal(xdr.ScAddress{
+			Type:          xdr.ScAddressTypeScAddressTypeMuxedContract,
+			MuxedContract: &xdr.MuxedContract{Id: 42, ContractId: *contractScAddr.ContractId},
+		}))
+		require.True(t, ok)
+		assert.Equal(t, contractAddr, s)
+	})
+
+	t.Run("refuses a claimable-balance address", func(t *testing.T) {
+		var h xdr.Hash
+		_, ok := addrString(scAddrVal(xdr.ScAddress{
+			Type:               xdr.ScAddressTypeScAddressTypeClaimableBalance,
+			ClaimableBalanceId: &xdr.ClaimableBalanceId{Type: xdr.ClaimableBalanceIdTypeClaimableBalanceIdTypeV0, V0: &h},
+		}))
+		assert.False(t, ok)
+	})
+
+	t.Run("refuses a liquidity-pool address", func(t *testing.T) {
+		var pool xdr.PoolId
+		_, ok := addrString(scAddrVal(xdr.ScAddress{
+			Type:            xdr.ScAddressTypeScAddressTypeLiquidityPool,
+			LiquidityPoolId: &pool,
+		}))
+		assert.False(t, ok)
+	})
 }
 
 func TestU32Val(t *testing.T) {

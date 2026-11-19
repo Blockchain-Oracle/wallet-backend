@@ -19,6 +19,8 @@ import (
 
 	"github.com/stellar/go-stellar-sdk/strkey"
 	"github.com/stellar/go-stellar-sdk/xdr"
+
+	"github.com/stellar/wallet-backend/internal/indexer/types"
 )
 
 // mapGet returns the value keyed by the Symbol sym in an ScMap, and whether
@@ -62,14 +64,17 @@ func i128ToBigInt(parts xdr.Int128Parts) *big.Int {
 }
 
 // addrString decodes an ScVal holding an Address into its strkey-encoded
-// string form (G... for accounts, C... for contracts).
+// string form (G... for accounts, C... for contracts). It goes through
+// types.StorableAddressString, as the SEP-41 processor does (#756): a muxed
+// address reduces to its base, and a claimable-balance or liquidity-pool
+// address, which no account row can store, reports ok=false.
 func addrString(v xdr.ScVal) (string, bool) {
 	addr, ok := v.GetAddress()
 	if !ok {
 		return "", false
 	}
-	s, err := addr.String()
-	if err != nil {
+	s, storable, err := types.StorableAddressString(addr)
+	if err != nil || !storable {
 		return "", false
 	}
 	return s, true
