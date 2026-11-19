@@ -34,11 +34,21 @@ func MinimumBalance(account xdr.AccountEntry) int64 {
 // pass, not per-transaction) — so a refund is the chronologically-last change to its account, and
 // phaseRefund dominating operations is correct, not an inversion. accountSortKey makes phase the
 // dominant term, so fee < operation < refund holds regardless of transaction or operation index.
+//
+// Before protocol 23 Core credits a Soroban refund in the transaction's own txChangesAfter, right
+// after that transaction's operations and before the next transaction applies. Those changes stay
+// in phaseOperation with opSlotAfterOperations, which sorts above every operation of their
+// transaction and below every operation of the next one.
 const (
 	phaseFee       uint8 = 0
 	phaseOperation uint8 = 1
 	phaseRefund    uint8 = 2
 )
+
+// opSlotAfterOperations is the highest operation index accountSortKey can hold (13 bits). No
+// transaction has that many operations (the protocol allows 100), so a change keyed with it sorts
+// after every operation of its transaction.
+const opSlotAfterOperations uint32 = 1<<13 - 1
 
 // accountSortKey ranks a native-balance change within a single ledger by
 // (phase, txIndex, opIndex). The buffer keeps the highest key per account, so this
@@ -95,16 +105,18 @@ func (p *AccountsProcessor) ProcessOperation(ctx context.Context, opWrapper *Tra
 
 // ProcessTransactionFees extracts native balance changes from a transaction's fee
 // phases. The fee debit (GetFeeChanges) is charged before any operation applies; the
-// Soroban fee refund (GetPostApplyFeeChanges) is credited after all operations.
-// Neither appears in any operation's meta, so the per-operation path never sees an
-// account whose balance moves only in these phases — e.g. a fee-bump fee source
-// (issue #637).
+// Soroban fee refund is credited after all operations: from protocol 23 in the
+// post-apply fee changes (GetPostApplyFeeChanges), before it in the transaction's
+// txChangesAfter. None of these appears in any operation's meta, so the per-operation
+// path never sees an account whose balance moves only in these phases — e.g. a
+// fee-bump fee source (issue #637).
 //
 // Balances are absolute (Core has already applied the fee/refund to the ledger
 // entry), so the sort key only steers the buffer's dedup to the correct winner:
-// fee changes get phaseFee and refund changes get phaseRefund, which sort below and
-// above every operation respectively — reproducing the on-chain order
-// fee < operation < refund (see accountSortKey).
+// fee changes get phaseFee and post-apply refunds get phaseRefund, which sort below
+// and above every operation respectively — reproducing the on-chain order
+// fee < operation < refund (see accountSortKey). txChangesAfter sorts right after
+// its own transaction's operations (opSlotAfterOperations).
 func (p *AccountsProcessor) ProcessTransactionFees(ctx context.Context, tx ingest.LedgerTransaction) ([]types.AccountChange, error) {
 	startTime := time.Now()
 	defer func() {
@@ -117,8 +129,30 @@ func (p *AccountsProcessor) ProcessTransactionFees(ctx context.Context, tx inges
 	ledgerSeq := tx.Ledger.LedgerSequence()
 
 	feeChanges := p.buildAccountChanges(tx.GetFeeChanges(), ledgerSeq, accountSortKey(phaseFee, tx.Index, 0))
+	afterChanges := p.buildAccountChanges(txChangesAfter(tx), ledgerSeq, accountSortKey(phaseOperation, tx.Index, opSlotAfterOperations))
 	refundChanges := p.buildAccountChanges(tx.GetPostApplyFeeChanges(), ledgerSeq, accountSortKey(phaseRefund, tx.Index, 0))
-	return append(feeChanges, refundChanges...), nil
+	changes := append(feeChanges, afterChanges...)
+	return append(changes, refundChanges...), nil
+}
+
+// txChangesAfter returns the changes Core applies after a transaction's operations
+// (TransactionMeta v2-v4 txChangesAfter), where the Soroban fee refund is credited
+// before protocol 23. go-stellar-sdk only exposes them inside GetChanges; like it,
+// they are left out for a txINTERNAL_ERROR before protocol 13.
+func txChangesAfter(tx ingest.LedgerTransaction) []ingest.Change {
+	if tx.Result.Result.Result.Code == xdr.TransactionResultCodeTxInternalError && tx.LedgerVersion <= 12 {
+		return nil
+	}
+	var after xdr.LedgerEntryChanges
+	switch tx.UnsafeMeta.V {
+	case 2:
+		after = tx.UnsafeMeta.MustV2().TxChangesAfter
+	case 3:
+		after = tx.UnsafeMeta.MustV3().TxChangesAfter
+	case 4:
+		after = tx.UnsafeMeta.MustV4().TxChangesAfter
+	}
+	return ingest.GetChangesFromLedgerEntryChanges(after)
 }
 
 // buildAccountChanges converts the account-typed entries in a ledger change set into

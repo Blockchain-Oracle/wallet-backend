@@ -4,6 +4,7 @@ package processors
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/stellar/go-stellar-sdk/ingest"
@@ -337,6 +338,45 @@ func TestAccountsProcessor_ProcessTransactionFees(t *testing.T) {
 	}
 }
 
+// Before protocol 23 Core credits a Soroban fee refund in the transaction's own txChangesAfter
+// (TransactionMetaV3), not in the post-apply fee changes, and it does so for failed transactions
+// too. Pubnet ledger 56085459 (protocol 22) refunds 7 accounts this way.
+func TestAccountsProcessor_ProcessTransactionFees_refundInTxChangesAfter(t *testing.T) {
+	processor := NewAccountsProcessor(nil)
+	testAccount := accountA.ToAccountId()
+	const ledgerSeq = uint32(12345)
+
+	balanceChange := func(stateBalance, updatedBalance int64) xdr.LedgerEntryChanges {
+		return xdr.LedgerEntryChanges{
+			{Type: xdr.LedgerEntryChangeTypeLedgerEntryState, State: accountLedgerEntry(testAccount, stateBalance)},
+			{Type: xdr.LedgerEntryChangeTypeLedgerEntryUpdated, Updated: accountLedgerEntry(testAccount, updatedBalance)},
+		}
+	}
+
+	for _, isFailed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failed=%t", isFailed), func(t *testing.T) {
+			tx := createFeeAndRefundTx(balanceChange(100_000_000, 99_000_000), nil, isFailed)
+			// a fresh meta: someTx's V3 is shared with other tests
+			tx.UnsafeMeta = xdr.TransactionMeta{V: 3, V3: &xdr.TransactionMetaV3{
+				Operations:     []xdr.OperationMeta{{}},
+				TxChangesAfter: balanceChange(99_000_000, 99_700_000),
+			}}
+
+			changes, err := processor.ProcessTransactionFees(context.Background(), tx)
+			require.NoError(t, err)
+			require.Len(t, changes, 2)
+
+			assert.Equal(t, accountSortKey(phaseFee, tx.Index, 0), changes[0].SortKey)
+			assert.Equal(t, int64(99_000_000), changes[0].Balance)
+
+			assert.Equal(t, testAccount.Address(), changes[1].AccountID)
+			assert.Equal(t, ledgerSeq, changes[1].LedgerNumber)
+			assert.Equal(t, accountSortKey(phaseOperation, tx.Index, opSlotAfterOperations), changes[1].SortKey)
+			assert.Equal(t, int64(99_700_000), changes[1].Balance, "the refunded balance")
+		})
+	}
+}
+
 func TestAccountSortKey(t *testing.T) {
 	// Phase dominates tx/op: a fee in a late tx still sorts below an operation in an
 	// early tx, which sorts below a refund in an early tx — the canonical fee < op < refund.
@@ -348,6 +388,12 @@ func TestAccountSortKey(t *testing.T) {
 	assert.Less(t, accountSortKey(phaseRefund, 3, 0), accountSortKey(phaseRefund, 7, 0))
 	assert.Less(t, accountSortKey(phaseOperation, 5, 1), accountSortKey(phaseOperation, 5, 2))
 	assert.Less(t, accountSortKey(phaseOperation, 5, 2), accountSortKey(phaseOperation, 6, 1))
+
+	// A pre-protocol-23 refund in txChangesAfter sorts after every operation of its own
+	// transaction and before every operation of the next one: it is credited in between.
+	assert.Less(t, accountSortKey(phaseOperation, 5, 99), accountSortKey(phaseOperation, 5, opSlotAfterOperations))
+	assert.Less(t, accountSortKey(phaseOperation, 5, opSlotAfterOperations), accountSortKey(phaseOperation, 6, 0))
+	assert.Less(t, accountSortKey(phaseOperation, (1<<20)-1, opSlotAfterOperations), accountSortKey(phaseRefund, 0, 0))
 
 	// Stays positive at the SDK field maxima (tx 2^20-1, op 4095) and below the next phase.
 	maxOp := accountSortKey(phaseOperation, (1<<20)-1, 4095)
