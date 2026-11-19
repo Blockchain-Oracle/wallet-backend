@@ -31,6 +31,7 @@ func TestIngestionMetrics_Registration(t *testing.T) {
 	require.NotNil(t, m.StateChangesTotal)
 	require.NotNil(t, m.WasmClassificationFailuresTotal)
 	require.NotNil(t, m.ProtocolDecodeFailuresTotal)
+	require.NotNil(t, m.AuthTreeWalkTruncationsTotal)
 }
 
 func TestIngestionMetrics_WasmClassificationFailures(t *testing.T) {
@@ -240,6 +241,7 @@ func TestIngestionMetrics_Lint(t *testing.T) {
 		m.WasmClassificationFailuresTotal,
 		m.ExternalRefContractsTotal,
 		m.ProtocolDecodeFailuresTotal,
+		m.AuthTreeWalkTruncationsTotal,
 	} {
 		problems, err := testutil.CollectAndLint(c)
 		require.NoError(t, err)

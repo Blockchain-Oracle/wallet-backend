@@ -5,10 +5,28 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/stellar/go-stellar-sdk/support/log"
 	"github.com/stellar/go-stellar-sdk/xdr"
 
 	"github.com/stellar/wallet-backend/internal/indexer/types"
 	"github.com/stellar/wallet-backend/internal/metrics"
+)
+
+// Bounds on the walk of one operation's declared auth invocation trees. The trees are
+// submitter input: without these the walk is as deep and as wide as whatever the XDR
+// decoder, core and the host happen to accept. Past a bound the walk stops descending
+// and the operation keeps what was found so far. It must never return an error for
+// this: core has already included the transaction, so an error here would fail the
+// same ledger on every retry.
+//
+// Both bounds sit above what a transaction in a closed ledger carries today, so they
+// drop no real deploy. The deepest auth tree stellar-core v30.0.0 applies is 245
+// invocations in one chain (246 is included but fails): the host decodes each auth
+// entry with an XDR depth limit of 500, two levels per nested invocation. A
+// transaction of the maximum size (132,096 bytes) holds fewer than 2,600 invocations.
+const (
+	maxAuthWalkDepth = 256
+	maxAuthWalkNodes = 4096
 )
 
 // ContractDeployProcessor emits state changes for contract deployments.
@@ -33,7 +51,7 @@ func (p *ContractDeployProcessor) StateChangeSubBase() int64 {
 }
 
 // ProcessOperation emits a state change for each contract deployment (including subinvocations).
-func (p *ContractDeployProcessor) ProcessOperation(_ context.Context, op *TransactionOperationWrapper) ([]types.StateChange, error) {
+func (p *ContractDeployProcessor) ProcessOperation(ctx context.Context, op *TransactionOperationWrapper) ([]types.StateChange, error) {
 	if op.OperationType() != xdr.OperationTypeInvokeHostFunction {
 		return nil, ErrInvalidOpType
 	}
@@ -112,8 +130,23 @@ func (p *ContractDeployProcessor) ProcessOperation(_ context.Context, op *Transa
 	if err != nil {
 		return nil, err
 	}
-	var walkInvocation func(inv xdr.SorobanAuthorizedInvocation) error
-	walkInvocation = func(inv xdr.SorobanAuthorizedInvocation) error {
+	// No instance was created, so no declaration can be confirmed: skip the walk.
+	if len(created) == 0 {
+		return stateChanges, nil
+	}
+	// visited counts invocations across every auth entry of the operation; truncatedBy
+	// names the first bound that cut the walk short ("depth" or "nodes").
+	visited := 0
+	truncatedBy := ""
+	var walkInvocation func(inv xdr.SorobanAuthorizedInvocation, depth int) error
+	walkInvocation = func(inv xdr.SorobanAuthorizedInvocation, depth int) error {
+		if depth >= maxAuthWalkDepth {
+			if truncatedBy == "" {
+				truncatedBy = "depth"
+			}
+			return nil
+		}
+		visited++
 		// Bind the args to a local first: a field of a function's return value is not
 		// addressable.
 		var preimage *xdr.ContractIdPreimage
@@ -140,16 +173,38 @@ func (p *ContractDeployProcessor) ProcessOperation(_ context.Context, op *Transa
 			}
 		}
 		for _, sub := range inv.SubInvocations {
-			if err := walkInvocation(sub); err != nil {
+			if visited >= maxAuthWalkNodes {
+				if truncatedBy == "" {
+					truncatedBy = "nodes"
+				}
+				break
+			}
+			if err := walkInvocation(sub, depth+1); err != nil {
 				return err
 			}
 		}
 		return nil
 	}
 	for _, auth := range invokeHostOp.Auth {
-		if err := walkInvocation(auth.RootInvocation); err != nil {
+		if visited >= maxAuthWalkNodes {
+			if truncatedBy == "" {
+				truncatedBy = "nodes"
+			}
+			break
+		}
+		if err := walkInvocation(auth.RootInvocation, 0); err != nil {
 			return nil, err
 		}
+	}
+	if truncatedBy != "" {
+		// Count and log it rather than fail: the ledger is valid, only this walk is cut short.
+		if p.metricsService != nil {
+			p.metricsService.AuthTreeWalkTruncationsTotal.WithLabelValues(truncatedBy).Inc()
+		}
+		log.Ctx(ctx).Warnf(
+			"processor: %s: auth tree walk stopped at the %s bound (max depth %d, max nodes %d); nested deploys declared past it are not recorded: txHash: %s, opID: %d",
+			p.Name(), truncatedBy, maxAuthWalkDepth, maxAuthWalkNodes, op.Transaction.Result.TransactionHash.HexString(), opID,
+		)
 	}
 
 	return stateChanges, nil

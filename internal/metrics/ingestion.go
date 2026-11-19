@@ -95,6 +95,15 @@ type IngestionMetrics struct {
 	// "BLEND"); kind is "event" or "entry".
 	// PromQL: rate(wallet_ingestion_protocol_decode_failures_total[5m]) > 0
 	ProtocolDecodeFailuresTotal *prometheus.CounterVec
+	// AuthTreeWalkTruncationsTotal counts InvokeHostFunction operations whose
+	// declared auth invocation trees were larger than the contract-deploy
+	// processor walks. The bound label is "depth" or "nodes". The operation is
+	// still ingested; a nested deploy declared past the bound gets no
+	// contract-deploy state change. The bounds sit above what a successful
+	// transaction can carry at current network limits, so any non-zero value
+	// means those limits were raised and the bounds need a review.
+	// PromQL: increase(wallet_ingestion_auth_tree_walk_truncations_total[1h]) > 0
+	AuthTreeWalkTruncationsTotal *prometheus.CounterVec
 }
 
 func newIngestionMetrics(reg prometheus.Registerer) *IngestionMetrics {
@@ -191,6 +200,10 @@ func newIngestionMetrics(reg prometheus.Registerer) *IngestionMetrics {
 			Name: "wallet_ingestion_protocol_decode_failures_total",
 			Help: "Contract events and ledger entries with a recognized key/topic symbol that failed to decode, by protocol_id and kind (\"event\" or \"entry\"). A recognized symbol with an unexpected payload signals probable contract drift; the affected event or entry is dropped.",
 		}, []string{"protocol_id", "kind"}),
+		AuthTreeWalkTruncationsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "wallet_ingestion_auth_tree_walk_truncations_total",
+			Help: "InvokeHostFunction operations whose declared auth invocation trees exceeded the contract-deploy walk bounds, by bound (\"depth\" or \"nodes\"). The operation is still ingested; nested deploys declared past the bound are not recorded.",
+		}, []string{"bound"}),
 	}
 	reg.MustRegister(
 		m.LatestLedger,
@@ -213,6 +226,7 @@ func newIngestionMetrics(reg prometheus.Registerer) *IngestionMetrics {
 		m.WasmClassificationFailuresTotal,
 		m.ExternalRefContractsTotal,
 		m.ProtocolDecodeFailuresTotal,
+		m.AuthTreeWalkTruncationsTotal,
 	)
 	return m
 }

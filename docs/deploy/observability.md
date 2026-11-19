@@ -201,6 +201,7 @@ Recorded on `ingest`. The lag gauge updates once per second in live mode only.
 | `wallet_ingestion_protocol_state_processing_duration_seconds` | histogram | `protocol_id`, `phase` | Protocol state time per phase: `process_ledger`, `persist_history`, `persist_current_state` |
 | `wallet_ingestion_wasm_classification_failures_total` | counter | `protocol_id`, `reason` | WASM classification errors. `protocol_id` is the validator tried, or `unknown`. `reason` is `spec_extraction_error` or `validate_error`. Re-run `protocol-setup` to recover |
 | `wallet_ingestion_external_ref_contracts_total` | counter | none | Contract instances whose executable is a CAP-0085 external reference with no WASM hash. These stay unclassified |
+| `wallet_ingestion_auth_tree_walk_truncations_total` | counter | `bound` | InvokeHostFunction operations whose declared auth trees exceeded the contract-deploy walk bounds. `bound` is `depth` or `nodes`. The operation is still ingested; nested deploys declared past the bound are not recorded |
 
 ### Protocol migration
 

@@ -6,12 +6,15 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stellar/go-stellar-sdk/network"
 	"github.com/stellar/go-stellar-sdk/xdr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/stellar/wallet-backend/internal/indexer/types"
+	"github.com/stellar/wallet-backend/internal/metrics"
 	"github.com/stellar/wallet-backend/internal/utils"
 )
 
@@ -538,4 +541,191 @@ func Test_ContractDeployProcessor_Process_failedTxDeploysNothing(t *testing.T) {
 	stateChanges, err := proc.ProcessOperation(context.Background(), op)
 	require.NoError(t, err)
 	assert.Empty(t, stateChanges)
+}
+
+// declaredCreate is a CreateContract auth node for deployerAccountID with TestSalt, and the
+// contract ID that preimage derives.
+func declaredCreate(t *testing.T) (xdr.SorobanAuthorizedInvocation, string) {
+	t.Helper()
+	preimage := xdr.ContractIdPreimageFromAddress{Address: makeScAddress(deployerAccountID), Salt: TestSalt}
+	contractID, err := calculateContractID(network.TestNetworkPassphrase, preimage)
+	require.NoError(t, err)
+	return xdr.SorobanAuthorizedInvocation{
+		Function: xdr.SorobanAuthorizedFunction{
+			Type: xdr.SorobanAuthorizedFunctionTypeSorobanAuthorizedFunctionTypeCreateContractHostFn,
+			CreateContractHostFn: &xdr.CreateContractArgs{
+				ContractIdPreimage: xdr.ContractIdPreimage{
+					Type:        xdr.ContractIdPreimageTypeContractIdPreimageFromAddress,
+					FromAddress: &preimage,
+				},
+				Executable: xdr.ContractExecutable{Type: xdr.ContractExecutableTypeContractExecutableWasm, WasmHash: &xdr.Hash{}},
+			},
+		},
+	}, contractID
+}
+
+// contractFnNode is an auth node that declares a plain contract call.
+func contractFnNode(subs ...xdr.SorobanAuthorizedInvocation) xdr.SorobanAuthorizedInvocation {
+	return xdr.SorobanAuthorizedInvocation{
+		Function: xdr.SorobanAuthorizedFunction{
+			Type:       xdr.SorobanAuthorizedFunctionTypeSorobanAuthorizedFunctionTypeContractFn,
+			ContractFn: &xdr.InvokeContractArgs{ContractAddress: makeScContract(invokedContractID), FunctionName: "f"},
+		},
+		SubInvocations: subs,
+	}
+}
+
+// chainAbove wraps leaf in depth contract-call nodes, so leaf sits depth levels below the root.
+func chainAbove(leaf xdr.SorobanAuthorizedInvocation, depth int) xdr.SorobanAuthorizedInvocation {
+	node := leaf
+	for i := 0; i < depth; i++ {
+		node = contractFnNode(node)
+	}
+	return node
+}
+
+// opWithAuthRoots builds a successful InvokeContract operation that declares the given auth
+// trees, round-trips the auth entries through XDR the way they arrive from a ledger, and
+// attaches a meta in which createdContractID's instance was created.
+func opWithAuthRoots(t *testing.T, createdContractID string, roots ...xdr.SorobanAuthorizedInvocation) *TransactionOperationWrapper {
+	t.Helper()
+	op := makeInvokeContractOp()
+	for _, root := range roots {
+		entry := xdr.SorobanAuthorizationEntry{
+			Credentials:    xdr.SorobanCredentials{Type: xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount},
+			RootInvocation: root,
+		}
+		raw, err := entry.MarshalBinary()
+		require.NoError(t, err)
+		var decoded xdr.SorobanAuthorizationEntry
+		require.NoError(t, xdr.SafeUnmarshal(raw, &decoded), "the tree must be one the XDR decoder accepts")
+		op.Operation.Body.InvokeHostFunctionOp.Auth = append(op.Operation.Body.InvokeHostFunctionOp.Auth, decoded)
+	}
+	setOperationMeta(op, xdr.LedgerEntryChanges{contractInstanceCreated(createdContractID)}, nil)
+	return op
+}
+
+// Test_ContractDeployProcessor_Process_oversizedAuthTreeNeverFails pins the two properties of
+// the auth-tree walk bounds. The tree is submitter input and core includes the transaction
+// whatever its shape, so (1) no tree may make ProcessOperation return an error, because an
+// error fails the ledger on every retry, and (2) a tree past a bound is cut short, counted
+// and logged, while a tree inside the bounds is walked in full.
+func Test_ContractDeployProcessor_Process_oversizedAuthTreeNeverFails(t *testing.T) {
+	create, contractID := declaredCreate(t)
+	wide := func(siblings int) xdr.SorobanAuthorizedInvocation {
+		subs := make([]xdr.SorobanAuthorizedInvocation, 0, siblings+1)
+		for i := 0; i < siblings; i++ {
+			subs = append(subs, contractFnNode())
+		}
+		return contractFnNode(append(subs, create)...)
+	}
+
+	testCases := []struct {
+		name        string
+		roots       []xdr.SorobanAuthorizedInvocation
+		wantDeploy  bool
+		wantTruncBy string
+	}{
+		{
+			name:       "65_deep_chain_is_walked_in_full",
+			roots:      []xdr.SorobanAuthorizedInvocation{chainAbove(create, 65)},
+			wantDeploy: true,
+		},
+		{
+			// The deepest tree stellar-core v30.0.0 applies is 245 invocations in one chain.
+			name:       "245_deep_chain_the_deepest_core_applies_is_walked_in_full",
+			roots:      []xdr.SorobanAuthorizedInvocation{chainAbove(create, 244)},
+			wantDeploy: true,
+		},
+		{
+			// A 246-deep chain is included in a ledger too (today its transaction fails).
+			name:       "246_deep_chain_is_walked_in_full",
+			roots:      []xdr.SorobanAuthorizedInvocation{chainAbove(create, 245)},
+			wantDeploy: true,
+		},
+		{
+			name:       "deploy_on_the_deepest_level_walked",
+			roots:      []xdr.SorobanAuthorizedInvocation{chainAbove(create, maxAuthWalkDepth-1)},
+			wantDeploy: true,
+		},
+		{
+			name:        "deploy_one_level_past_the_depth_bound_is_skipped",
+			roots:       []xdr.SorobanAuthorizedInvocation{chainAbove(create, maxAuthWalkDepth)},
+			wantTruncBy: "depth",
+		},
+		{
+			name:        "chain_far_past_the_depth_bound_is_skipped",
+			roots:       []xdr.SorobanAuthorizedInvocation{chainAbove(create, maxAuthWalkDepth+300)},
+			wantTruncBy: "depth",
+		},
+		{
+			name:       "wide_tree_inside_the_node_bound_is_walked_in_full",
+			roots:      []xdr.SorobanAuthorizedInvocation{wide(maxAuthWalkNodes - 2)},
+			wantDeploy: true,
+		},
+		{
+			name:        "wide_tree_past_the_node_bound_is_skipped",
+			roots:       []xdr.SorobanAuthorizedInvocation{wide(maxAuthWalkNodes + 1000)},
+			wantTruncBy: "nodes",
+		},
+		{
+			name: "node_bound_spans_the_auth_entries_of_one_operation",
+			roots: []xdr.SorobanAuthorizedInvocation{
+				wide(maxAuthWalkNodes/2 - 2).SubInvocations[0], // one node
+				chainAbove(contractFnNode(), 10),
+				contractFnNode(wide(maxAuthWalkNodes).SubInvocations[:maxAuthWalkNodes]...),
+				create,
+			},
+			wantTruncBy: "nodes",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ingestionMetrics := metrics.NewMetrics(prometheus.NewRegistry()).Ingestion
+			proc := NewContractDeployProcessor(network.TestNetworkPassphrase, ingestionMetrics)
+			op := opWithAuthRoots(t, contractID, tc.roots...)
+
+			stateChanges, err := proc.ProcessOperation(context.Background(), op)
+			require.NoError(t, err, "an oversized declared auth tree must never fail the operation")
+
+			if tc.wantDeploy {
+				assertStateChangesElementsMatch(t, []types.StateChange{
+					NewStateChangeBuilder(12345, closeTime.Unix(), op.TransactionID()).
+						WithOperationID(op.ID()).
+						WithReason(types.StateChangeReasonCreate).
+						WithCategory(types.StateChangeCategoryAccount).
+						WithCreator(deployerAccountID).
+						WithAccount(contractID).
+						Build(),
+				}, stateChanges)
+			} else {
+				assert.Empty(t, stateChanges)
+			}
+
+			for _, bound := range []string{"depth", "nodes"} {
+				want := 0.0
+				if bound == tc.wantTruncBy {
+					want = 1.0
+				}
+				assert.Equal(t, want, testutil.ToFloat64(ingestionMetrics.AuthTreeWalkTruncationsTotal.WithLabelValues(bound)), "truncations counted for bound %q", bound)
+			}
+		})
+	}
+}
+
+// Test_ContractDeployProcessor_Process_noCreatedInstanceSkipsAuthWalk: with no created
+// instance in the meta nothing can be confirmed, so the declared trees are not walked at
+// all, however large, and nothing is counted as truncated.
+func Test_ContractDeployProcessor_Process_noCreatedInstanceSkipsAuthWalk(t *testing.T) {
+	create, contractID := declaredCreate(t)
+	ingestionMetrics := metrics.NewMetrics(prometheus.NewRegistry()).Ingestion
+	proc := NewContractDeployProcessor(network.TestNetworkPassphrase, ingestionMetrics)
+	op := opWithAuthRoots(t, contractID, chainAbove(create, maxAuthWalkDepth+300))
+	setOperationMeta(op, nil, nil)
+
+	stateChanges, err := proc.ProcessOperation(context.Background(), op)
+	require.NoError(t, err)
+	assert.Empty(t, stateChanges)
+	assert.Equal(t, 0.0, testutil.ToFloat64(ingestionMetrics.AuthTreeWalkTruncationsTotal.WithLabelValues("depth")))
 }
